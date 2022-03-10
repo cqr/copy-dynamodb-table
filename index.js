@@ -2,11 +2,12 @@
 var AWS = require('aws-sdk')
 var validate = require('./validate')
 var readline = require('readline')
+const AsyncQueue = require('./async_queue');
 
-function copy(values, fn) {
+function copy(options, fn) {
 
   try {
-    validate.config(values)
+    validate.config(options)
   } catch (err) {
     if (err) {
       return fn(err, {
@@ -17,34 +18,38 @@ function copy(values, fn) {
   }
 
   var options = {
-    config: values.config,
+    config: options.config,
     source: {
-      tableName: values.source.tableName,
-      dynamoClient: values.source.dynamoClient || new AWS.DynamoDB.DocumentClient(values.source.config || values.config),
-      dynamodb: values.source.dynamodb || new AWS.DynamoDB(values.source.config || values.config),
-      active: values.source.active
+      tableName: options.source.tableName,
+      dynamoClient: options.source.dynamoClient || new AWS.DynamoDB.DocumentClient(options.source.config || options.config),
+      dynamodb: options.source.dynamodb || new AWS.DynamoDB(options.source.config || options.config),
+      active: options.source.active
     },
     destination: {
-      tableName: values.destination.tableName,
-      dynamoClient: values.destination.dynamoClient || new AWS.DynamoDB.DocumentClient(values.destination.config || values.config),
-      dynamodb: values.destination.dynamodb || new AWS.DynamoDB(values.destination.config || values.config),
-      active: values.destination.active,
+      tableName: options.destination.tableName,
+      dynamoClient: options.destination.dynamoClient || new AWS.DynamoDB.DocumentClient(options.destination.config || options.config),
+      dynamodb: options.destination.dynamodb || new AWS.DynamoDB(options.destination.config || options.config),
+      active: options.destination.active,
       createTableStr: 'Creating Destination Table '
     },
-    key: values.key,
-    counter: values.counter || 0,
+    key: options.key,
+    counter: options.counter || 0,
+    queue: options.queue || new AsyncQueue({ backpressureMax: 100000 }),
     retries: 0,
     data: {},
-    transform: values.transform,
-    log: values.log,
-    create: values.create,
-    schemaOnly: values.schemaOnly,
-    continuousBackups: values.continuousBackups
+    maxOutgoingRequests: options.maxOutgoingRequests || 100,
+    transform: options.transform,
+    log: options.log,
+    create: options.create,
+    schemaOnly: options.schemaOnly,
+    continuousBackups: options.continuousBackups,
+    readComplete: false,
+    readCount: 0
   }
 
-  if (options.source.active && options.destination.active) { // both tables are active
-    return startCopying(options, fn)
-  }
+  // if (options.source.active && options.destination.active) { // both tables are active
+  //   return startCopying(options, fn)
+  // }
 
   if (options.create) { // create table if not exist
     return options.source.dynamodb.describeTable({ TableName: options.source.tableName }, function (err, data) {
@@ -64,11 +69,12 @@ function copy(values, fn) {
     })
   }
 
-  checkTables(options, function (err, data) { // check if source and destination table exist
+  checkTables(options, async function (err, data) { // check if source and destination table exist
     if (err) {
       return fn(err, data)
     }
-    startCopying(options, fn)
+    await startCopying(options);
+    console.log(+ new Date());
   })
 
 }
@@ -186,7 +192,7 @@ function checkTables(options, fn) {
 
 function waitForActive(options, fn) {
   setTimeout(function () {
-    options.destination.dynamodb.describeTable({ TableName: options.destination.tableName }, function (err, data) {
+    options.destination.dynamodb.describeTable({ TableName: options.destination.tableName }, async function (err, data) {
       if (err) {
         return fn(err, data)
       }
@@ -209,105 +215,125 @@ function waitForActive(options, fn) {
         })
       }
       if (options.continuousBackups) { // copy backup options
-        return setContinuousBackups(options, function (err) {
+        return setContinuousBackups(options, async function (err) {
           if (err) {
             return fn(err, data)
           }
-          startCopying(options, fn);
+          await startCopying(options);
+          console.log(+new Date());
         })
       }
-      startCopying(options, fn);
+      await startCopying(options);
+      console.log(+new Date());
     })
   }, 1000) // check every second
 }
 
-function startCopying(options, fn) {
-  getItems(options, function (err, data) {
-    if (err) {
-      return fn(err)
+async function startReading(options) {
+  while (true) {
+    const data = await getItems(options);
+    options.readCount += (data.Items || []).length;
+    options.key = data.LastEvaluatedKey;
+    log(options);
+    await options.queue.push(...data.Items);
+    if (typeof data.LastEvaluatedKey === 'undefined') {
+      break;
     }
-    options.data = data
-    options.key = data.LastEvaluatedKey
-    putItems(options, function (err) {
-      if (err) {
-        return fn(err)
-      }
+  }
+}
 
+async function startCopying(options) {
+  startReading(options).then(() => options.readComplete = true);
+  const writeWorkers = [];
+  for (let i = 0; i < options.maxOutgoingRequests; i++) {
+    console.log("starting worker " + (i + 1));
+    writeWorkers.push(startWriteWorker(options));
+  }
+  await Promise.all(writeWorkers);
+}
+
+async function startWriteWorker(options) {
+  while (!options.readComplete || !options.queue.empty()) {
+    try {
+      const records = await options.queue.take(25);
+    const successful = await putItems(options, records);
+    options.counter += successful;
+    log(options);
+    if (successful < records.length) {
       if (options.log) {
-        readline.clearLine(process.stdout)
-        readline.cursorTo(process.stdout, 0)
-        process.stdout.write('Copied ' + options.counter + ' items')
+        process.stdout.write('*')
       }
-
-      if (options.key === undefined) {
-        return fn(err, {
-          count: options.counter,
-          status: 'SUCCESS'
-        })
-      }
-      copy(options, fn)
-    })
-  })
-}
-
-function getItems(options, fn) {
-  scan(options, function (err, data) {
-    if (err) {
-      return fn(err, data)
+      await timeout(250);
+    } else {
+      process.stdout.write(' ');
     }
-    fn(err, mapItems(options, data))
-  })
+    } catch (e) {
+      console.error(e);
+    }
+    
+  }
+}
+
+function log(options) {
+  if (options.log) {
+    readline.clearLine(process.stdout);
+    readline.cursorTo(process.stdout, 0);
+    process.stdout.write(`Read ${options.readCount} Wrote ${options.counter} `);
+  }
+}
+
+async function getItems(options) {
+  return mapItems(options, await scan(options));
 }
 
 
-function scan(options, fn) {
-  options.source.dynamoClient.scan({
-    TableName: options.source.tableName,
-    Limit: 25,
-    ExclusiveStartKey: options.key
-  }, fn)
+async function timeout(duration) {
+  return new Promise(resolve => {
+    setTimeout(resolve, duration);
+  });
 }
+
+function scan(options) {
+  return new Promise((resolve, reject) => {
+    options.source.dynamoClient.scan({
+      TableName: options.source.tableName,
+      Limit: 25,
+      ExclusiveStartKey: options.key
+    }, (error, data) => {
+      if (error) { return reject(error) }
+      resolve(data);
+    });
+  });
+}
+
+// const up = new Array(100).fill(undefined).map((x, i) => i);
 
 function mapItems(options, data) {
-  data.Items = data.Items.map(function (item, index) {
-    return {
-      PutRequest: {
-        Item: !!options.transform ? options.transform(item, index) : item
-      }
-    }
-  })
-  return data
+  data.Items = data.Items.map(options.transform ? options.transform : (i) => i);
+  return data;
 }
 
-function putItems(options, fn) {
-  if (!options.data.Items || options.data.Items.length === 0) {
-    return fn(null, options)
+async function putItems(options, items) {
+  if (!items || items.length === 0) {
+    return 0;
   }
+
   var batchWriteItems = {}
   batchWriteItems.RequestItems = {}
-  batchWriteItems.RequestItems[options.destination.tableName] = options.data.Items
-  options.destination.dynamoClient.batchWrite(batchWriteItems, function (err, data) {
-    if (err) {
-      return fn(err, data)
-    }
-    var unprocessedItems = data.UnprocessedItems[options.destination.tableName]
-    if (unprocessedItems !== undefined) {
-
-      options.retries++
-      options.counter += (options.data.Items.length - unprocessedItems.length)
-
-      options.data = {
-        Items: unprocessedItems
+  batchWriteItems.RequestItems[options.destination.tableName] = items.map(item => ({ PutRequest: { Item: item } }));
+  return new Promise((resolve, reject) => {
+    options.destination.dynamoClient.batchWrite(batchWriteItems, async function (err, data) {
+      if (err) {
+        await options.queue.push(...items);
+        return reject(err);
       }
-      return setTimeout(function () {
-        putItems(options, fn)
-      }, 2 * options.retries * 100) // from aws http://docs.aws.amazon.com/general/latest/gr/api-retries.html
-
-    }
-    options.retries = 0
-    options.counter += options.data.Items.length
-    fn(err, options)
-  })
+      const unprocessed = data.UnprocessedItems[options.destination.tableName];
+      if (unprocessed && unprocessed.length) {
+        options.queue.push(...unprocessed.map(item => item.PutRequest.Item));
+      }
+      return resolve(items.length - (unprocessed ? unprocessed.length : 0));
+    });
+  });
 }
 
 module.exports.copy = copy
